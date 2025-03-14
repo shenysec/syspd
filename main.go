@@ -162,7 +162,7 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 		//响应
 		invalid_url_c.OnResponse(func(r *colly.Response) {
 			if string(body) != "" && r.StatusCode == 200 {
-				if CosineSimilar([]rune(string(body)), []rune(string(r.Body))) >= 0.95 {
+				if CosineSimilar([]rune(string(body)), []rune(string(r.Body))) >= 0.99 {
 					s.Links = append(s.Links, r.Request.URL.String())
 				}
 			}
