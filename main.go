@@ -1,15 +1,15 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gocolly/colly"
@@ -18,14 +18,22 @@ import (
 )
 
 type Spiders struct {
-	Url   string
-	Host  string
-	Links []string
-	Api   []string
+	Url    string
+	Host   string
+	Cookie string
+	Links  []string
+	Api    []string
 }
 
 // 是否添加动态爬虫域名（爬取同顶级域名下子域内容）,默认为开启
 var DynamicAllowedDomains = 1
+
+// 403计数
+var (
+	errorCount int        // 错误计数器
+	errorUrl   string     //错误页面
+	mu         sync.Mutex // 互斥锁（用于并发安全）
+)
 
 // 正则
 var (
@@ -36,13 +44,18 @@ var (
 )
 
 // 创建爬虫
-func createCollector(host string, depth int, parallelism int, delay time.Duration) *colly.Collector {
+func (s *Spiders) createCollector(host string, depth int, parallelism int, delay time.Duration) *colly.Collector {
 
 	c := colly.NewCollector(
 		colly.IgnoreRobotsTxt(),
 		colly.AllowedDomains(host), // 允许域名
 		colly.MaxDepth(depth),      // 爬取深度
 	)
+	//设定cookie
+	if s.Cookie != "" {
+		cookie, _ := parseCookieString(s.Cookie)
+		c.SetCookies(host, cookie)
+	}
 
 	c.SetRequestTimeout(12 * time.Second) // 全局超时时间
 
@@ -55,17 +68,26 @@ func createCollector(host string, depth int, parallelism int, delay time.Duratio
 	return c
 }
 
+// cookie解析
+func parseCookieString(cookieStr string) ([]*http.Cookie, error) {
+	rawCookies := cookieStr
+	header := http.Header{}
+	header.Add("Cookie", rawCookies)
+	request := http.Request{Header: header}
+	return request.Cookies(), nil
+}
+
 // 公共http请求组件
 func commonHTTPRequest(targetURL string) (*http.Response, error) {
 
 	client := &http.Client{
-		Timeout: 10 * time.Second, // 设置超时时间为 10 秒
+		Timeout: 15 * time.Second, // 设置超时时间为 10 秒
 	}
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4471.124 Safari/537.36")
 
 	return client.Do(req)
 }
@@ -97,7 +119,7 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 	if flag == 0 {
 		// colly Collector创建
 		delay := 1500 * time.Millisecond
-		api_c := createCollector(string(s.Host), 10, 10, delay)
+		api_c := s.createCollector(string(s.Host), 10, 10, delay)
 		// 生命周期
 		// 请求前
 		api_c.OnRequest(func(r *colly.Request) {
@@ -154,7 +176,7 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 		}
 		// colly Collector创建
 		delay := 100 * time.Millisecond
-		invalid_url_c := createCollector(string(s.Host), depth, parallelism, delay)
+		invalid_url_c := s.createCollector(string(s.Host), depth, parallelism, delay)
 		//生命周期
 		invalid_url_c.OnRequest(func(r *colly.Request) {
 			fmt.Println("爬取中……", r.URL)
@@ -169,24 +191,10 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 			// 处理js里面的url
 
 			if jsFileRegex.MatchString(r.Request.URL.String()) {
-				for _, url := range urlRegex.FindAllString(string(r.Body), -1) {
-					req, errs := commonHTTPRequest(url)
-					if errs != nil || req == nil {
-						s.Links = append(s.Links, url)
-						fmt.Println("Request failed or is nil:", errs)
-						continue
-					}
-					defer func() {
-						if req.Body != nil {
-							req.Body.Close()
-						}
-					}()
-					if req.StatusCode == 404 {
-						s.Links = append(s.Links, url)
-					}
-				}
+				s.jsORsj(string(r.Body), r.Request.URL.String())
 			}
 		})
+
 		// 选择器
 		invalid_url_c.OnHTML("*", func(e *colly.HTMLElement) {
 			// 处理 href 属性
@@ -194,7 +202,7 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 				if DynamicAllowedDomains == 1 {
 					s.handleLink(invalid_url_c, href)
 				}
-				if !pdfFileRegex.MatchString(e.Request.URL.String()) {
+				if !pdfFileRegex.MatchString(href) {
 					e.Request.Visit(href)
 				}
 
@@ -205,29 +213,14 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 				if DynamicAllowedDomains == 1 {
 					s.handleLink(invalid_url_c, src)
 				}
-				if !pdfFileRegex.MatchString(e.Request.URL.String()) {
+				if !pdfFileRegex.MatchString(src) {
 					e.Request.Visit(src)
 				}
 			}
 			// 处理<cript>标签里的url
 			if e.Name == "script" {
 				if urlRegex.FindStringSubmatch(e.Text) != nil {
-					for _, url := range urlRegex.FindAllString(e.Text, -1) {
-						req, errs := commonHTTPRequest(url)
-						if errs != nil || req == nil {
-							s.Links = append(s.Links, url)
-							fmt.Println("Request failed or is nil:", errs)
-							continue
-						}
-						defer func() {
-							if req.Body != nil {
-								req.Body.Close()
-							}
-						}()
-						if req.StatusCode == 404 {
-							s.Links = append(s.Links, url)
-						}
-					}
+					s.jsORsj(e.Text, e.Request.URL.String())
 				}
 			}
 		})
@@ -236,14 +229,57 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 		})
 		// 错误信息
 		invalid_url_c.OnError(func(r *colly.Response, err error) {
-			if r.StatusCode == 404 || err.Error() == "request timed out" {
-				s.Links = append(s.Links, r.Request.URL.String())
+			if err.Error() != "" {
+				if r != nil && r.StatusCode == 403 {
+					mu.Lock()         // 加锁
+					defer mu.Unlock() // 解锁
+					errorCount++
+					if errorCount == 1 {
+						errorUrl = r.Request.URL.String()
+					}
+					if errorCount >= 3 {
+						req, _ := commonHTTPRequest(s.Url)
+						if req != nil && req.StatusCode == 403 {
+							fmt.Println("ip可能已被封禁,请手动检测！" + "第一次403Url:" + errorUrl)
+						} else if req != nil && req.StatusCode == 200 {
+							errorCount = 0
+						}
+					}
+				}
+				s.Links = append(s.Links, r.Request.Headers.Get("Referer")+"  ==>  "+r.Request.URL.String())
 			}
 		})
 		// 访问
 		invalid_url_c.Visit(s.Url)
 	}
 	return s.Api, s.Links
+}
+
+// js与script内容处理
+func (s *Spiders) jsORsj(x string, frontUrl string) {
+	for _, url := range urlRegex.FindAllString(x, -1) {
+		req, errs := commonHTTPRequest(url)
+		if errs != nil || req == nil {
+			s.Links = append(s.Links, frontUrl+"  ==>  "+url)
+			continue
+		}
+		defer func() {
+			if req.Body != nil {
+				req.Body.Close()
+			}
+		}()
+
+		switch {
+		case req.StatusCode == 403:
+			// 单独处理 403 错误
+			if strings.HasSuffix(url, ".html") {
+				s.Links = append(s.Links, frontUrl+"  ==>  "+url)
+			}
+		case req.StatusCode >= 400 && req.StatusCode < 600:
+			// 处理其他4xx、5xx错误
+			s.Links = append(s.Links, frontUrl+"  ==>  "+url)
+		}
+	}
 }
 
 // 处理链接，动态添加子域名
@@ -263,6 +299,7 @@ func (s *Spiders) handleLink(c *colly.Collector, link string) {
 	if strings.HasSuffix(domain, "."+TLDPlusOne) || domain == TLDPlusOne {
 		// 如果域名尚未在 AllowedDomains 中，则动态添加
 		if !contains(c.AllowedDomains, domain) {
+
 			c.AllowedDomains = append(c.AllowedDomains, domain)
 			println("Added domain to allowed list:", domain)
 		}
@@ -344,8 +381,12 @@ func indexOfSclie(slice []rune, item rune) int {
 	return -1
 }
 
-func spider(url string, flag int, dep int, pll int) {
+func spider(url string, flag int, dep int, pll int, extras ...string) {
 	a := Spiders{Url: url}
+	// 检查是否有传递 cookie
+	if len(extras) > 0 && extras[0] != "" {
+		a.Cookie = extras[0] //设定cookie
+	}
 	_, links := a.Crawler(flag, dep, pll)
 	fmt.Print("无效链接：\r\n")
 
@@ -357,27 +398,20 @@ func spider(url string, flag int, dep int, pll int) {
 
 func main() {
 
-	// 检查是否提供了足够的参数
-	if len(os.Args) < 4 {
-		fmt.Println("使用方法: syspd.exe url 爬取深度 并发数")
+	// 定义命令行参数，并设置默认值和提示信息
+	url := flag.String("u", "", "URL to process")
+	function := flag.Int("f", 1, "Function to execute (1 for default -失效链接)")
+	depth := flag.Int("d", 3, "Depth of processing")
+	concurrency := flag.Int("p", 3, "Number of concurrent processes")
+	cookie := flag.String("c", "", "Cookie for authentication")
+
+	// 解析命令行参数
+	flag.Parse()
+	if *url == "" {
+		fmt.Printf("Wrong URL,maby u need \"--help\" !")
 		return
 	}
 
-	// 获取命令行参数
-	url := os.Args[1]
-	// 将爬取深度（dep）和并发数（pll）从字符串转换为整数
-	dep, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		fmt.Println("爬取深度必须是整数")
-		return
-	}
-
-	pll, err := strconv.Atoi(os.Args[3])
-	if err != nil {
-		fmt.Println("并发数必须是整数")
-		return
-	}
-
-	spider(url, 1, dep, pll)
+	spider(*url, *function, *depth, *concurrency, *cookie)
 
 }
