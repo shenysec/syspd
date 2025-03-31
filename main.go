@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -15,18 +16,62 @@ import (
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/extensions"
 	"golang.org/x/net/publicsuffix"
+	"golang.org/x/sys/windows"
 )
 
 type Spiders struct {
 	Url    string
 	Host   string
-	Cookie string
 	Links  []string
 	Api    []string
+	Config *SpiderConfig
 }
 
-// 是否添加动态爬虫域名（爬取同顶级域名下子域内容）,默认为开启
-var DynamicAllowedDomains = 1
+type SpiderConfig struct {
+	Flag        int           // 功能
+	Depth       int           // 爬取深度
+	Concurrency int           // 并发数
+	Cookie      string        // cookie
+	Headers     MapFlag       // 自定义header
+	Delay       time.Duration // 请求延时
+	TriggerWaf  int           // waf处理
+
+	DynamicAllowedDomains int // 是否添加动态爬虫域名
+}
+
+func NewSpiderConfig() *SpiderConfig {
+	return &SpiderConfig{
+		Flag:                  1, //默认使用失效链接扫描,
+		Depth:                 3,
+		Concurrency:           3,               // 默认并发数
+		Delay:                 1 * time.Second, // 默认延迟
+		DynamicAllowedDomains: 1,               // 默认动态域名
+		TriggerWaf:            1,               //默认触发WAF
+	}
+}
+
+// MapFlag 自定义类型实现 flag.Value 接口,实现自定义header
+type MapFlag map[string]string
+
+func (m *MapFlag) String() string {
+	return fmt.Sprintf("%v", *m)
+}
+
+func (m *MapFlag) Set(value string) error {
+	if *m == nil {
+		*m = make(MapFlag)
+	}
+
+	pairs := strings.Split(value, ",")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			return fmt.Errorf(" invalid pair: %s", pair)
+		}
+		(*m)[kv[0]] = kv[1]
+	}
+	return nil
+}
 
 // 403计数
 var (
@@ -52,8 +97,8 @@ func (s *Spiders) createCollector(host string, depth int, parallelism int, delay
 		colly.MaxDepth(depth),      // 爬取深度
 	)
 	//设定cookie
-	if s.Cookie != "" {
-		cookie, _ := parseCookieString(s.Cookie)
+	if s.Config.Cookie != "" {
+		cookie, _ := parseCookieString(s.Config.Cookie)
 		c.SetCookies(host, cookie)
 	}
 
@@ -95,20 +140,20 @@ func commonHTTPRequest(targetURL string) (*http.Response, error) {
 // 爬虫
 // flag 0 API 扫描
 // flag 1 失效链接
-func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, links []string) {
+func (s *Spiders) Crawler() (api []string, links []string) {
 
 	//返回值
 	m := make(map[string]int)
 	//URL解析
 	parsedURL, err := url.Parse(s.Url)
 	if err != nil {
-		fmt.Println("URL 解析错误:", err)
+		fmt.Println(" URL 解析错误:", err)
 		return
 	}
 	//测试连通性
 	_, err = commonHTTPRequest(s.Url)
 	if err != nil {
-		fmt.Println("连接失败,请检查输入链接:", err)
+		fmt.Println(" 连接失败,请检查输入链接:", err)
 		return
 	}
 	// 提取 host
@@ -116,7 +161,7 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 	// 提取协议部分（basehttp）
 	basehttp := parsedURL.Scheme + "://"
 
-	if flag == 0 {
+	if s.Config.Flag == 0 {
 		// colly Collector创建
 		delay := 1500 * time.Millisecond
 		api_c := s.createCollector(string(s.Host), 10, 10, delay)
@@ -149,7 +194,7 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 		})
 		// 错误信息
 		api_c.OnError(func(_ *colly.Response, err error) {
-			fmt.Println("Something went wrong:", err)
+			fmt.Println(" Something went wrong:", err)
 		})
 		// 访问
 		api_c.Visit(s.Url)
@@ -158,33 +203,60 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 			s.Api = append(s.Api, basehttp+s.Host+k)
 		}
 	}
-	if flag == 1 {
+	if s.Config.Flag == 1 {
 		// 失效链接处理
 		//获取waf404页面
-		req, err := commonHTTPRequest(basehttp + s.Host + "/page?param=<script>alert(1)</script>")
-		if err != nil {
-			fmt.Println("请求失败:", err)
-		}
-		// 确保 req 不为 nil 后再执行 defer 和读取 Body
-		var body []byte
-		if req != nil {
-			defer req.Body.Close()
-			body, err = io.ReadAll(req.Body)
+		var WafBody []byte
+		if s.Config.TriggerWaf == 1 {
+			req, err := commonHTTPRequest(basehttp + s.Host + "/page?param=<script>alert(1)</script>")
 			if err != nil {
-				fmt.Println("读取 404PageBody 失败:", err)
+				{
+				} // fmt.Println(" 请求失败:", err)
+			}
+			// 确保 req 不为 nil 后再执行 defer 和读取 Body
+
+			if req != nil {
+				defer req.Body.Close()
+				WafBody, err = io.ReadAll(req.Body)
+				if err != nil {
+					{
+					} // fmt.Println(" 读取 404PageBody 失败:", err)
+				}
 			}
 		}
+
+		var wj = true
 		// colly Collector创建
-		delay := 100 * time.Millisecond
-		invalid_url_c := s.createCollector(string(s.Host), depth, parallelism, delay)
+
+		invalid_url_c := s.createCollector(string(s.Host), s.Config.Depth, s.Config.Concurrency, s.Config.Delay)
 		//生命周期
 		invalid_url_c.OnRequest(func(r *colly.Request) {
-			fmt.Println("爬取中……", r.URL)
+			// 自定义header
+			if s.Config.Headers != nil {
+				for k, v := range s.Config.Headers {
+					r.Headers.Set(k, v)
+				}
+
+			}
+
+			// 输出到固定位置
+			fmt.Printf("\x1b[2;1H") // 光标
+			if wj {
+				fmt.Print("\x1b[K \x1b[38;5;205;48;5;234mProgress: ..\x1b[0m")
+				wj = !wj
+			} else {
+				fmt.Print("\x1b[K \x1b[38;5;205;48;5;234mProgress: ...\x1b[0m")
+				wj = !wj
+			}
+
+			fmt.Printf("\x1b[6;1H") // 光标
+			fmt.Printf("\x1b[K \x1b[32;47m正在爬取: %s\x1b[0m", r.URL)
+
 		})
 		//响应
 		invalid_url_c.OnResponse(func(r *colly.Response) {
-			if string(body) != "" && r.StatusCode == 200 {
-				if CosineSimilar([]rune(string(body)), []rune(string(r.Body))) >= 0.99 {
+			if string(WafBody) != "" && r.StatusCode == 200 {
+				if CosineSimilar([]rune(string(WafBody)), []rune(string(r.Body))) >= 0.99 {
 					s.Links = append(s.Links, r.Request.URL.String())
 				}
 			}
@@ -199,7 +271,7 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 		invalid_url_c.OnHTML("*", func(e *colly.HTMLElement) {
 			// 处理 href 属性
 			if href := e.Attr("href"); href != "" {
-				if DynamicAllowedDomains == 1 {
+				if s.Config.DynamicAllowedDomains == 1 {
 					s.handleLink(invalid_url_c, href)
 				}
 				if !pdfFileRegex.MatchString(href) {
@@ -210,7 +282,7 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 
 			// 处理 src 属性
 			if src := e.Attr("src"); src != "" {
-				if DynamicAllowedDomains == 1 {
+				if s.Config.DynamicAllowedDomains == 1 {
 					s.handleLink(invalid_url_c, src)
 				}
 				if !pdfFileRegex.MatchString(src) {
@@ -237,10 +309,12 @@ func (s *Spiders) Crawler(flag int, depth int, parallelism int) (api []string, l
 					if errorCount == 1 {
 						errorUrl = r.Request.URL.String()
 					}
-					if errorCount >= 3 {
+					if errorCount >= 10 {
 						req, _ := commonHTTPRequest(s.Url)
 						if req != nil && req.StatusCode == 403 {
-							fmt.Println("ip可能已被封禁,请手动检测！" + "第一次403Url:" + errorUrl)
+							fmt.Printf("\x1b[8;1H") // 光标
+							fmt.Println("\x1b[K \x1b[32;47m ip可能已被封禁,请手动检测！\x1b[0m" + "第一次403Url:" + errorUrl)
+							os.Exit(0)
 						} else if req != nil && req.StatusCode == 200 {
 							errorCount = 0
 						}
@@ -301,7 +375,9 @@ func (s *Spiders) handleLink(c *colly.Collector, link string) {
 		if !contains(c.AllowedDomains, domain) {
 
 			c.AllowedDomains = append(c.AllowedDomains, domain)
-			println("Added domain to allowed list:", domain)
+
+			fmt.Printf("\x1b[4;1H") // 光标
+			fmt.Printf("\x1b[K \x1b[38;5;205;48;5;234mAdded domain to allowed list: %s\x1b[0m", domain)
 		}
 	}
 }
@@ -381,37 +457,53 @@ func indexOfSclie(slice []rune, item rune) int {
 	return -1
 }
 
-func spider(url string, flag int, dep int, pll int, extras ...string) {
-	a := Spiders{Url: url}
-	// 检查是否有传递 cookie
-	if len(extras) > 0 && extras[0] != "" {
-		a.Cookie = extras[0] //设定cookie
-	}
-	_, links := a.Crawler(flag, dep, pll)
-	fmt.Print("无效链接：\r\n")
+func spider(url string, config SpiderConfig) {
+	a := Spiders{Url: url, Config: &config}
+
+	fmt.Printf("\x1b[2J")
+
+	_, links := a.Crawler()
+	fmt.Println()
+	fmt.Println()
+	fmt.Println(" \x1b[38;5;205;48;5;234m无效链接: \x1b[0m")
+	fmt.Println()
 
 	for _, v := range links {
-		fmt.Print(v, "\r\n")
+		fmt.Printf(" \x1b[38;5;205;48;5;234m%s\r\n\x1b[0m", v)
 	}
+}
 
+func init() {
+	// 启用 Windows 的 VT100 支持
+	stdout := windows.Handle(os.Stdout.Fd())
+	var mode uint32
+	windows.GetConsoleMode(stdout, &mode)
+	mode |= windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING // 使用预定义的常量
+	windows.SetConsoleMode(stdout, mode)
 }
 
 func main() {
 
+	config := NewSpiderConfig()
+
 	// 定义命令行参数，并设置默认值和提示信息
 	url := flag.String("u", "", "URL to process")
-	function := flag.Int("f", 1, "Function to execute (1 for default -失效链接)")
-	depth := flag.Int("d", 3, "Depth of processing")
-	concurrency := flag.Int("p", 3, "Number of concurrent processes")
-	cookie := flag.String("c", "", "Cookie for authentication")
+	flag.IntVar(&config.Flag, "f", config.Flag, "Function to execute (1 for default -失效链接)")
+	flag.IntVar(&config.Depth, "d", config.Depth, "Depth of processing")
+	flag.IntVar(&config.Concurrency, "p", config.Concurrency, "Number of concurrent processes")
+	flag.StringVar(&config.Cookie, "c", config.Cookie, "Cookie for authentication")
+	flag.IntVar(&config.TriggerWaf, "thw", config.TriggerWaf, "Trigger The Waf (1 for Trigger)")
+
+	// 注册自定义 flag
+	flag.Var(&config.Headers, "h", "Headers in key=value format, comma separated")
 
 	// 解析命令行参数
 	flag.Parse()
 	if *url == "" {
-		fmt.Printf("Wrong URL,maby u need \"--help\" !")
+		fmt.Printf(" Wrong URL,maby u need \"--help\" !")
 		return
 	}
 
-	spider(*url, *function, *depth, *concurrency, *cookie)
+	spider(*url, *config)
 
 }
