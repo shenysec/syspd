@@ -3,11 +3,10 @@
 
 ## 最近更新
 ~~~
-1、更换为flag进行参数解析
-2、支持添加cookie使用
-3、添加失效链接来源标记
-4、处理所有4xx、5xx响应情况
-5、IP封禁检测提醒
+1.现在可以控制是否触发WAF
+2.添加自定义header功能
+3.增加IP封禁判断的容错
+4.美化使界面更好看
 ~~~
 ## 使用方法
 ~~~ 
@@ -19,8 +18,12 @@
         Depth of processing (default 3)
   -f int
         Function to execute (1 for default -失效链接) (default 1)
+  -h value
+        Headers in key=value format, comma separated
   -p int
         Number of concurrent processes (default 3)
+  -thw int
+        Trigger The Waf (1 for Trigger) (default 1)
   -u string
         URL to process
 ~~~
